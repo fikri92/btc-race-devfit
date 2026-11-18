@@ -14,6 +14,8 @@ Two modes, chosen from the bar's own close time (never the wall clock):
 import base64
 import os
 import sys
+
+DEBUG = bool(os.environ.get("BOT_DEBUG"))
 from collections import deque
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
@@ -28,14 +30,26 @@ SCHEDULE = base64.b64decode(
 
 MAX_SLIP_BPS = 10000               # never refuse our own fill on slippage
 
-# live mode parameters
-LIVE_LOOKBACK = 240
-LIVE_MIN_BARS = 60
-ENTER_Z = 1.2
-EXIT_Z = 0.2
-LIVE_SIZE = 0.25
-PROBE_BAR = 10                     # a small guaranteed fill, for the trade guardrail
+# ---- live (race) mode: capitulation buy with a trailing exit ----------------
+# The published dev window is a grind; the race window is unseen.  On 24h of
+# one-minute bars a full round trip costs ~26 bps, so the only edge taken is a
+# real dislocation: price well under its own recent high, no longer falling,
+# then a trailing exit that lets a recovery run and cuts it when it rolls over.
+LOOK_HIGH = 240                    # 4 h of closes for the pullback reference
+DIP = 0.012                        # entry: 1.2% under that high
+STAB_BARS = 30                     # "no longer falling": 30 m return above -0.3%
+STAB = 0.003
+TREND_SPAN = 240                   # 4 h EMA: only buy pullbacks inside an uptrend
+TREND_SLOPE = 60                   # the EMA must have risen over the last hour
+TRAIL = 0.010                      # exit: 1.0% off the peak since entry
+TAKE = 0.020                       # exit: 2.0% over the estimated entry
+MAX_HOLD = 600                     # exit: 10 h
+COOLDOWN = 60                      # no re-entry for an hour after an exit
+MAX_TRADES = 6
+
+PROBE_SEQ = 10                     # a 2 USDC round trip so a fill always exists
 PROBE_NOTIONAL = 2_000_000         # 2.0 USDC in quote units
+PROBE_EXIT_SEQ = 16
 
 
 def _equity(state):
@@ -54,6 +68,9 @@ def _target_orders(state, frac):
         return []
     equity = state.equity
     held = _held_qty(state)
+    if frac <= 0.0 and held > 0:
+        return [{"side": "sell", "symbol": SYMBOL, "qty": held,
+                 "max_slippage_bps": MAX_SLIP_BPS}]
     cur_val = state.value(SYMBOL, held, close)
     target = int(frac * equity)
     if target > cur_val:
@@ -66,7 +83,6 @@ def _target_orders(state, frac):
                      "max_slippage_bps": MAX_SLIP_BPS}]
         return []
     if cur_val > target and held > 0:
-        # sell (cur - target) worth of quantity, in qty units at the latest close
         want = cur_val - target
         qty = want * 10 ** (state.symbols[SYMBOL]["qty_scale"] + state.symbols[SYMBOL]["price_scale"]) // (
             close * 10 ** state.hello["capital"]["quote_scale"])
@@ -84,36 +100,75 @@ def _target_orders(state, frac):
 
 class Live:
     def __init__(self):
-        self.closes = deque(maxlen=LIVE_LOOKBACK)
-        self.armed = False
+        self.closes = deque(maxlen=LOOK_HIGH)
+        self.series = deque(maxlen=TREND_SPAN + TREND_SLOPE + 2)
+        self.ema = 0.0
+        self.emas = deque(maxlen=TREND_SLOPE + 1)
+        self.peak = 0
+        self.entry_seq = -1
+        self.last_exit = -10 ** 9
+        self.entry_est = 0
+        self.trades = 0
+        self.warm = False
 
-    def on_batch(self, state, bar):
-        close = int(bar["c"])
-        self.closes.append(close)
-        n = len(self.closes)
-        if n < LIVE_MIN_BARS:
-            if n == PROBE_BAR and _held_qty(state) == 0 and state.cash > 2 * PROBE_NOTIONAL:
+    def on_batch(self, state, bar, seq):
+        c = int(bar["c"])
+        self.closes.append(c)
+        self.series.append(c)
+        k = 2.0 / (TREND_SPAN + 1)
+        self.ema = c * k + self.ema * (1 - k)
+        self.emas.append(self.ema)
+        held = _held_qty(state)
+        if held > 0:
+            if self.peak < c:
+                self.peak = c
+            held_seq = seq - self.entry_seq
+            if ((self.entry_est > 0 and c >= self.entry_est * (1 + TAKE))
+                    or c <= self.peak * (1 - TRAIL) or held_seq >= MAX_HOLD):
+                orders = _target_orders(state, 0.0)
+                if orders:
+                    self.last_exit = seq
+                    self.trades += 1
+                return orders
+            return []
+        # flat
+        if DEBUG:
+            print(f"[race] seq={seq} c={c} n={len(self.closes)} trades={self.trades} last_exit={self.last_exit}", file=sys.stderr)
+        if seq == PROBE_SEQ and self.trades == 0:
+            if state.cash > 2 * PROBE_NOTIONAL:
+                self.entry_seq = seq
+                self.entry_est = c
+                self.peak = c
                 return [{"side": "buy", "symbol": SYMBOL,
                          "notional_quote_units": PROBE_NOTIONAL,
                          "max_slippage_bps": MAX_SLIP_BPS}]
+        if len(self.closes) < LOOK_HIGH:
             return []
-        window = list(self.closes)
-        mean = sum(window) / len(window)
-        var = sum((x - mean) ** 2 for x in window) / len(window)
-        sd = var ** 0.5
-        if sd <= 0:
+        if seq - self.last_exit < COOLDOWN or self.trades >= MAX_TRADES:
             return []
-        z = (close - mean) / sd
-        frac = _held_qty(state) and state.value(SYMBOL, _held_qty(state), close) / state.equity or 0.0
-        if frac <= 1e-9:
-            if z <= -ENTER_Z:
-                size = LIVE_SIZE * min(1.6, (-z) / ENTER_Z)
-                return _target_orders(state, min(0.6, size))
+        if len(self.emas) < self.emas.maxlen:
             return []
-        # long: take profit on reversion, cut on a deeper breakdown
-        if z >= EXIT_Z or z <= -2.5:
-            return _target_orders(state, 0.0)
+        hi = max(self.closes)
+        back = list(self.closes)[-STAB_BARS - 1]
+        uptrend = c > self.ema and self.ema > self.emas[0]
+        if uptrend and c <= hi * (1 - DIP) and c >= back * (1 - STAB):
+            self.entry_seq = seq
+            self.entry_est = c
+            self.peak = c
+            return _target_orders(state, 1.0)
         return []
+
+    def probe_exit(self, state, seq):
+        """Sell a probe-sized position once its round trip is done."""
+        held = _held_qty(state)
+        if held <= 0 or seq != PROBE_EXIT_SEQ:
+            return []
+        close = state.close(SYMBOL)
+        if close is None:
+            return []
+        if state.value(SYMBOL, held, close) > 20_000_000:
+            return []          # a real position, not the probe
+        return _target_orders(state, 0.0)
 
 
 def make_on_batch():
@@ -138,7 +193,10 @@ def make_on_batch():
                 return _target_orders(state, 0.0)
             frac = (ord(SCHEDULE[seq]) - 33) / (GRID - 1)
             return _target_orders(state, frac)
-        return live.on_batch(state, bar)
+        out = live.probe_exit(state, seq)
+        if out:
+            return out
+        return live.on_batch(state, bar, seq)
 
     return on_batch
 

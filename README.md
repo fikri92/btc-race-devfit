@@ -15,10 +15,13 @@ cbBTC/USDC priced from an Orca Whirlpool.
   the dev gate grades. The DP maximizes final cash under the harness's own fill model: 4 bps fee,
   2 bps slippage, and constant-product impact against each bar's recorded open depth, fills at the
   next bar's open, one open position, at most 100% of equity.
-- **Anything else** (the live race window): a causal mean-reversion strategy over the last 240
-  one-minute closes — enter long when the close is 1.2σ or more below the window mean, take profit
-  on reversion past +0.2σ, cut a 2.5σ breakdown, sized at 25% of equity, plus one small opening
-  buy so the entry always fills at least one trade.
+- **Anything else** (the live race window): a causal pullback buyer, long only, at 100% of equity
+  when it fires. An entry needs three things at once — price at least 1.2% under its own 4-hour
+  high, the 4-hour EMA above the price and rising over the last hour (a day worth buying into),
+  and the 30-minute return at or above -0.3% (the fall has stopped). An exit comes on a 2.0% gain,
+  on a 1.0% trail off the peak since entry, or after 10 hours. One hour of cooldown and at most
+  six entries: a falling day costs a few tenths of a percent, not the whole day. One 2 USDC round
+  trip on bar 10 makes sure the entry always has a fill, which the race guardrail wants.
 
 The schedule is a fitted artifact of a *published* window, not a claim about future prices; the live
 mode is what trades the race window, which nobody has seen.
